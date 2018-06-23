@@ -50,3 +50,6 @@ build
 ### Ninja ###
 .ninja_deps
 .ninja_log
+
+### Project ###
+kaleidoscope
