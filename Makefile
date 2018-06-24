@@ -1,12 +1,8 @@
 CC=clang++
-SOURCES = $(wildcard src/*.cpp)
-OBJ = $(src:.cpp:.o)
+CFLAGS = -g -Og -rdynamic `llvm-config --cxxflags --ldflags --system-libs --libs all`
 
-CFLAGS = -g -Og -rdynamic
-LDFLAGS = `llvm-config --cxxflags --ldflags --system-libs --libs core mcjit native`
-
-kaleidoscope: $(SOURCES)
-	$(CC) -o $@ $^ $(CFLAGS) $(LDFLAGS)
+kaleidoscope: src/kaleidoscope.cpp
+	$(CC) -o $@ $^ $(CFLAGS)
 
 .PHONY: clean
 clean:
