@@ -6,9 +6,15 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/Support/TargetSelect.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Scalar/GVN.h"
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
@@ -18,6 +24,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include "../include/KaleidoscopeJIT.h"
 
 // Lexer {{{
 
@@ -64,7 +71,7 @@ static int gettok() {
     if (isdigit(LastChar) != 0 || LastChar == '.') { // Number: [0-9.]+
         std::string NumStr;
         do {
-            NumStr += std::to_string(LastChar);
+            NumStr += LastChar;
             LastChar = getchar();
         } while (isdigit(LastChar) != 0 || LastChar == '.');
 
@@ -410,46 +417,6 @@ static std::unique_ptr<FunctionAST> ParseTopLevelExpr() {
     return nullptr;
 }
 
-static void HandleDefinition() {
-    if (auto FnAST = ParseDefinition()) {
-        if (auto *FnIR = FnAST->codegen()) {
-            std::cerr << "Read function definition:";
-            FnIR->print(llvm::errs());
-            std::cerr << "\n";
-        }
-    } else {
-        // Skip token for error recovery.
-        getNextToken();
-    }
-}
-
-static void HandleExtern() {
-    if (auto ProtoAST = ParseExtern()) {
-        if (auto *FnIR = ProtoAST->codegen()) {
-            std::cerr << "Read extern:";
-            FnIR->print(llvm::errs());
-            std::cerr << "\n";
-        }
-    } else {
-        // Skip token for error recovery.
-        getNextToken();
-    }
-}
-
-static void HandleTopLevelExpression() {
-    // Evaluate a top-level expression into an anonymous function.
-    if (auto FnAST = ParseTopLevelExpr()) {
-        if (auto *FnIR = FnAST->codegen()) {
-            std::cerr << "Read top-level expression:";
-            FnIR->print(llvm::errs());
-            std::cerr << "\n";
-        }
-    } else {
-        // Skip token for error recovery.
-        getNextToken();
-    }
-}
-
 // }}}
 
 // Code Generation {{{
@@ -458,6 +425,9 @@ static llvm::LLVMContext TheContext;
 static llvm::IRBuilder<> Builder(TheContext);
 static std::unique_ptr<llvm::Module> TheModule;
 static std::map<std::string, llvm::Value *> NamedValues;
+static std::unique_ptr<llvm::legacy::FunctionPassManager> TheFPM;
+static std::unique_ptr<llvm::orc::KaleidoscopeJIT> TheJIT;
+static std::map<std::string, std::unique_ptr<PrototypeAST>> FunctionProtos;
 
 llvm::Value *LogErrorV(const char *Str) {
     LogError(Str);
@@ -500,9 +470,11 @@ llvm::Value *BinaryExprAST::codegen() {
     }
 }
 
+llvm::Function *getFunction(std::string Name);
+
 llvm::Value *CallExprAST::codegen() {
     // Look up the name in the global module table.
-    llvm::Function *CalleeF = TheModule->getFunction(Callee);
+    llvm::Function *CalleeF = getFunction(Callee);
     if (CalleeF == nullptr) {
         return LogErrorV("Unknown function referenced.");
     }
@@ -543,8 +515,14 @@ llvm::Function *PrototypeAST::codegen() {
 }
 
 llvm::Function *FunctionAST::codegen() {
-    // First, check for an existing function from a previous 'extern' declaration.
-    llvm::Function *TheFunction = TheModule->getFunction(Proto->getName());
+    // Transfer ownership of the prototype to the FunctionProtos map, but keep a
+    // reference to it for use below.
+    auto &P = *Proto;
+    FunctionProtos[Proto->getName()] = std::move(Proto);
+    llvm::Function *TheFunction = getFunction(P.getName());
+    if (TheFunction == nullptr) {
+        return nullptr;
+    }
 
     if (TheFunction == nullptr) {
         TheFunction = Proto->codegen();
@@ -575,6 +553,9 @@ llvm::Function *FunctionAST::codegen() {
         // Validate the generated code, checking for consistency.
         llvm::verifyFunction(*TheFunction);
 
+        // Optimize the function.
+        TheFPM->run(*TheFunction);
+
         return TheFunction;
     }
 
@@ -584,6 +565,122 @@ llvm::Function *FunctionAST::codegen() {
 }
 
 // }}}
+
+// JIT and Optimizer {{{
+
+void InitializeModuleAndPassManager(void) {
+    // Open a new module.
+    TheModule = llvm::make_unique<llvm::Module>("jit", TheContext);
+    TheModule->setDataLayout(TheJIT->getTargetMachine().createDataLayout());
+
+    // Create a new pass manager attached to it.
+    TheFPM = llvm::make_unique<llvm::legacy::FunctionPassManager>(TheModule.get());
+
+    // Do simple "peephole" optimizations and bit-twiddling optzns.
+    TheFPM->add(llvm::createInstructionCombiningPass());
+    // Reassociate expressions.
+    TheFPM->add(llvm::createReassociatePass());
+    // Eliminate common subexpressions.
+    TheFPM->add(llvm::createGVNPass());
+    // Simplify the control flow graph (deleting unreachable blocks, etc.).
+    TheFPM->add(llvm::createCFGSimplificationPass());
+
+    TheFPM->doInitialization();
+}
+
+llvm::Function *getFunction(std::string Name) {
+    // First, see if the function has already been added to the current module.
+    if (auto *F = TheModule->getFunction(Name)) {
+        return F;
+    }
+
+    // If not, check whether we can codegen the declaration from some existing
+    // prototype.
+    auto FI = FunctionProtos.find(Name);
+    if (FI != FunctionProtos.end()) {
+        return FI->second->codegen();
+    }
+
+    // If no existing prototype exists, return null.
+    return nullptr;
+}
+
+#ifdef _WIN32
+#define DLLEXPORT __declspec(dllexport)
+#else
+#define DLLEXPORT
+#endif
+
+/// putchard - putchar that takes a double and returns 0.
+extern "C" DLLEXPORT double putchard(double X) {
+  fputc((char)X, stderr);
+  return 0;
+}
+
+/// printd - printf that takes a double prints it as "%f\n", returning 0.
+extern "C" DLLEXPORT double printd(double X) {
+  fprintf(stderr, "%f\n", X);
+  return 0;
+}
+
+// }}}
+
+static void HandleDefinition() {
+    if (auto FnAST = ParseDefinition()) {
+        if (auto *FnIR = FnAST->codegen()) {
+            fprintf(stderr, "Read function definition:");
+            FnIR->print(llvm::errs());
+            fprintf(stderr, "\n");
+            TheJIT->addModule(std::move(TheModule));
+            InitializeModuleAndPassManager();
+        }
+    } else {
+        // Skip token for error recovery.
+        getNextToken();
+    }
+}
+
+static void HandleExtern() {
+    if (auto ProtoAST = ParseExtern()) {
+        if (auto *FnIR = ProtoAST->codegen()) {
+            fprintf(stderr, "Read extern:");
+            FnIR->print(llvm::errs());
+            fprintf(stderr, "\n");
+            FunctionProtos[ProtoAST->getName()] = std::move(ProtoAST);
+        }
+    } else {
+        // Skip token for error recovery.
+        getNextToken();
+    }
+}
+
+static void HandleTopLevelExpression() {
+    // Evaluate a top-level expression into an anonymous function.
+    if (auto FnAST = ParseTopLevelExpr()) {
+        if (auto *FnIR = FnAST->codegen()) {
+
+            // JIT the module containing the anonymous expression, keeping a handle so
+            // we can free it later.
+            auto H = TheJIT->addModule(std::move(TheModule));
+            InitializeModuleAndPassManager();
+
+            // Search the JIT for the __anon_expr symbol.
+            auto ExprSymbol = TheJIT->findSymbol("__anon_expr");
+            assert(ExprSymbol && "Function not found");
+
+            // Get the symbol's address and cast it to the right type (takes no
+            // arguments, returns a double) so we call it as a native function.
+            double (*FP)() = (double (*)())(intptr_t)cantFail(ExprSymbol.getAddress());
+            fprintf(stderr, "Evaluated to %f\n", FP());
+
+            // Delete the anonymous expression module from the JIT.
+            TheJIT->removeModule(H);
+        }
+    } else {
+        // Skip token for error recovery.
+        getNextToken();
+    }
+}
 
 /// top ::= definition | external | expression | ';'
 static void MainLoop() {
@@ -609,6 +706,10 @@ static void MainLoop() {
 }
 
 int main() {
+    llvm::InitializeNativeTarget();
+    llvm::InitializeNativeTargetAsmPrinter();
+    llvm::InitializeNativeTargetAsmParser();
+
     // Install standard binary operators.
     // 1 is lowest precedence.
     BinopPrecedence['<'] = 10;
@@ -620,8 +721,10 @@ int main() {
     std::cerr << "ready> ";
     getNextToken();
 
+    TheJIT = llvm::make_unique<llvm::orc::KaleidoscopeJIT>();
+
     // Make the module, which holds all the code.
-    TheModule = llvm::make_unique<llvm::Module>("jit", TheContext);
+    InitializeModuleAndPassManager();
 
     // Run the main "interpreter loop" now.
     MainLoop();
